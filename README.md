@@ -23,6 +23,37 @@ MLX-native Metal LLM engine: pure-Zig inference for **Qwen3.8-27B** (Qwen3.5 GDN
 
 ## Installation
 
+**One-liner (recommended) — latest prebuilt for macOS arm64:**
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/amitpandey-ai/mlx-runner/main/install.sh | bash
+mlx-runner --version
+mlx-runner --metal-check
+```
+
+Options:
+
+```sh
+# Custom prefix (/usr/local needs sudo mkdir/chown first)
+curl -fsSL https://raw.githubusercontent.com/amitpandey-ai/mlx-runner/main/install.sh | bash -s -- --prefix /usr/local --verbose
+
+# Specific version
+curl -fsSL https://raw.githubusercontent.com/amitpandey-ai/mlx-runner/main/install.sh | bash -s -- --version v0.1.0
+
+# Uninstall
+curl -fsSL https://raw.githubusercontent.com/amitpandey-ai/mlx-runner/main/install.sh | bash -s -- --uninstall
+# or: ./install.sh --uninstall --prefix $HOME/.local
+
+# Local run without curl
+./install.sh --help
+./install.sh --dry-run --verbose      # preview
+./install.sh --prefix $HOME/.local    # → $HOME/.local/bin/mlx-runner + $HOME/.local/lib/mlx-runner
+```
+
+The script installs `mlx-runner-macos-arm64.{tar.gz,zip}` from the latest GitHub Release (`checksums.txt` verified via `shasum -a 256`), fixes `rpath`s for `$PREFIX/lib/mlx-runner`, and verifies with `--version` + `--metal-check`. Requires macOS on Apple Silicon (`arm64`); Intel or non-macOS exits with build-from-source hint. If `api.github.com` is rate-limited, set `GITHUB_TOKEN` or pass `--version`.
+
+**Build from source (alternative):**
+
 ```sh
 # 1) Zig toolchain (pinned)
 bash scripts/fetch-zig.sh          # → .zig-toolchain/zig
