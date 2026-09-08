@@ -5,7 +5,7 @@ const server = @import("server.zig");
 const mlx = @import("mlx.zig");
 const config_mod = @import("config.zig");
 
-const VERSION = "0.1.0-zig";
+const VERSION = "0.1.1-zig";
 
 fn printUsage(io: std.Io) !void {
     var buf: [8192]u8 = undefined;
