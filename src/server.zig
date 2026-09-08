@@ -16,26 +16,57 @@ const api = @import("http_api.zig");
 /// on first request, LRU-evicted past `max_resident` (27B bf16 is ~55 GB
 /// resident; quants ~30 GB — two 27Bs do not fit this 128 GB box together).
 /// ids borrows the caller's model-dir slices (main blocks in serve).
+pub const ModelSpec = struct {
+    dir: []const u8,
+    alias: ?[]const u8 = null,
+    sampling: ?sampling.SamplingParams = null,
+    max_tokens: ?u32 = null,
+    ctx_size: ?u32 = null,
+    mtp: ?bool = null,
+    mtp_gamma: ?u32 = null,
+
+    pub fn id(self: ModelSpec) []const u8 {
+        return self.alias orelse std.fs.path.basename(self.dir);
+    }
+};
+
 pub const ModelRegistry = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
     base_cfg: engine_mod.EngineConfig,
     base_sampling: sampling.SamplingParams,
-    dirs: []const []const u8,
+    specs: []const ModelSpec,
     engines: std.StringHashMap(*engine_mod.Engine),
     lru: std.ArrayList([]const u8), // resident ids, front = oldest
     max_resident: usize,
 
-    pub const Resolved = struct { eng: *engine_mod.Engine, id: []const u8 };
+    pub const Resolved = struct { eng: *engine_mod.Engine, id: []const u8, max_tokens: ?u32 = null };
     pub const RegError = error{ UnknownModel, NoModelsConfigured };
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io, base_cfg: engine_mod.EngineConfig, base_sampling: sampling.SamplingParams, dirs: []const []const u8, max_resident: usize) ModelRegistry {
+        // Backward compat: dirs without per-model overrides
+        const specs = allocator.alloc(ModelSpec, dirs.len) catch @panic("oom");
+        for (dirs, 0..) |d, i| specs[i] = .{ .dir = d };
         return .{
             .allocator = allocator,
             .io = io,
             .base_cfg = base_cfg,
             .base_sampling = base_sampling,
-            .dirs = dirs,
+            .specs = specs,
+            .engines = std.StringHashMap(*engine_mod.Engine).init(allocator),
+            .lru = .empty,
+            .max_resident = @max(1, max_resident),
+        };
+    }
+
+    pub fn initWithSpecs(allocator: std.mem.Allocator, io: std.Io, base_cfg: engine_mod.EngineConfig, base_sampling: sampling.SamplingParams, specs: []const ModelSpec, max_resident: usize) !ModelRegistry {
+        const dup = try allocator.dupe(ModelSpec, specs);
+        return .{
+            .allocator = allocator,
+            .io = io,
+            .base_cfg = base_cfg,
+            .base_sampling = base_sampling,
+            .specs = dup,
             .engines = std.StringHashMap(*engine_mod.Engine).init(allocator),
             .lru = .empty,
             .max_resident = @max(1, max_resident),
@@ -50,31 +81,33 @@ pub const ModelRegistry = struct {
         }
         self.engines.deinit();
         self.lru.deinit(self.allocator);
+        self.allocator.free(self.specs);
     }
 
     pub fn defaultId(self: *const ModelRegistry) []const u8 {
-        return modelId(self.dirs[0]);
+        return self.specs[0].id();
     }
 
     /// Resolve a request `model` name (null = default) to a live engine,
-    /// loading and evicting as needed. Returned id borrows `dirs`.
+    /// loading and evicting as needed. Returned id borrows `specs`.
     pub fn resolve(self: *ModelRegistry, name: ?[]const u8) !Resolved {
-        if (self.dirs.len == 0) return RegError.NoModelsConfigured;
+        if (self.specs.len == 0) return RegError.NoModelsConfigured;
         const want = name orelse self.defaultId();
-        var dir: ?[]const u8 = null;
+        var spec: ?ModelSpec = null;
         var id: []const u8 = undefined;
-        for (self.dirs) |d| {
-            const mid = modelId(d);
+        for (self.specs) |s| {
+            const mid = s.id();
             if (std.mem.eql(u8, mid, want)) {
-                dir = d;
+                spec = s;
                 id = mid;
                 break;
             }
         }
-        const model_dir = dir orelse return RegError.UnknownModel;
+        const found = spec orelse return RegError.UnknownModel;
+        const model_dir = found.dir;
         if (self.engines.get(id)) |e| {
             self.touch(id);
-            return .{ .eng = e, .id = id };
+            return .{ .eng = e, .id = id, .max_tokens = found.max_tokens };
         }
         while (self.engines.count() >= self.max_resident) {
             const old = self.lru.orderedRemove(0);
@@ -87,14 +120,18 @@ pub const ModelRegistry = struct {
         std.log.info("[registry] loading {s} ({s})", .{ id, model_dir });
         var cfg = self.base_cfg;
         cfg.model = model_dir;
+        if (found.ctx_size) |v| cfg.ctx_size = v;
+        if (found.mtp) |v| cfg.mtp = v;
+        if (found.mtp_gamma) |v| cfg.mtp_gamma = v;
+        const samp = found.sampling orelse self.base_sampling;
         const e = try self.allocator.create(engine_mod.Engine);
         errdefer self.allocator.destroy(e);
-        e.* = try engine_mod.Engine.init(self.allocator, self.io, cfg, self.base_sampling);
+        e.* = try engine_mod.Engine.init(self.allocator, self.io, cfg, samp);
         errdefer e.deinit();
         std.log.info("[registry] {s} ready: ctx {d} temp={d} top_p={d} top_k={d} quant={s}", .{ id, e.model_max_ctx, e.base_sampling.temp, e.base_sampling.top_p, e.base_sampling.top_k, @tagName(e.mm.wm.quant.mode) });
         try self.engines.put(id, e);
         try self.lru.append(self.allocator, id);
-        return .{ .eng = e, .id = id };
+        return .{ .eng = e, .id = id, .max_tokens = found.max_tokens };
     }
 
     fn touch(self: *ModelRegistry, id: []const u8) void {
@@ -111,7 +148,7 @@ pub const ModelRegistry = struct {
 pub fn serve(allocator: std.mem.Allocator, io: std.Io, reg: *ModelRegistry, host: []const u8, port: u16) !void {
     const addr = try std.Io.net.IpAddress.parse(host, port);
     var listener = try addr.listen(io, .{});
-    std.log.info("mlx-runner serving {d} model(s) (OpenAI + Anthropic compat)", .{reg.dirs.len});
+    std.log.info("mlx-runner serving {d} model(s) (OpenAI + Anthropic compat)", .{reg.specs.len});
     var ids: u64 = 0;
     while (true) {
         const stream = listener.accept(io) catch continue;
@@ -156,7 +193,7 @@ fn dispatch(allocator: std.mem.Allocator, io: std.Io, reg: *ModelRegistry, req: 
     if (method == .GET and std.mem.eql(u8, path, "/v1/models")) {
         var names: std.ArrayList([]const u8) = .empty;
         defer names.deinit(allocator);
-        for (reg.dirs) |d| names.append(allocator, modelId(d)) catch
+        for (reg.specs) |s| names.append(allocator, s.id()) catch
             return failReq(req, false, .internal_server_error, "failed to build models response");
         const body = api.buildModelsList(allocator, names.items) catch
             return failReq(req, false, .internal_server_error, "failed to build models response");
@@ -330,7 +367,7 @@ fn chatRouteInner(allocator: std.mem.Allocator, io: std.Io, reg: *ModelRegistry,
             return;
         }
     }
-    const max_tokens = api.optU32(v, "max_tokens") orelse api.optU32(v, "max_completion_tokens") orelse default_max_tokens;
+    const max_tokens = api.optU32(v, "max_tokens") orelse api.optU32(v, "max_completion_tokens") orelse r.max_tokens orelse default_max_tokens;
     const stops = try api.collectStops(allocator, v, "stop");
     defer allocator.free(stops);
     const rs = sampling.RequestSampling{
@@ -374,7 +411,7 @@ fn completionsRouteInner(allocator: std.mem.Allocator, io: std.Io, reg: *ModelRe
     const prompt = api.optString(v, "prompt") orelse return error.BadMessages;
     const r = resolveRoute(reg, req, v, false) orelse return;
     const eng = r.eng;
-    const max_tokens = api.optU32(v, "max_tokens") orelse default_max_tokens;
+    const max_tokens = api.optU32(v, "max_tokens") orelse r.max_tokens orelse default_max_tokens;
     const stops = try api.collectStops(allocator, v, "stop");
     defer allocator.free(stops);
     const rs = sampling.RequestSampling{
@@ -440,7 +477,7 @@ fn messagesRouteInner(allocator: std.mem.Allocator, io: std.Io, reg: *ModelRegis
     const eng = r.eng;
     const mj = try api.normalizeAnthropic(allocator, api.get(v, "system"), messages);
     defer allocator.free(mj);
-    const max_tokens = api.optU32(v, "max_tokens") orelse default_max_tokens;
+    const max_tokens = api.optU32(v, "max_tokens") orelse r.max_tokens orelse default_max_tokens;
     const stops = try api.collectStops(allocator, v, "stop_sequences");
     defer allocator.free(stops);
     const rs = sampling.RequestSampling{

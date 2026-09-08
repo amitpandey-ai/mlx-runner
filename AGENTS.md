@@ -104,8 +104,17 @@ Python in the loop. Pinned: Zig 0.17.0-dev.1818+7051f8e73, mlx==0.32.2.
 - Registry (server.zig): `--model` repeatable, ids = dir basenames
   (duplicates rejected at startup), lazy load, LRU evict past
   `--max-resident-models` (default 1). Requests route via `model` field.
+- Per-model config (`src/config.zig:loadFile` + `src/server.zig:ModelSpec`):
+  `--config file.json` gives per-model `alias` (API id), `sampling`
+  (temp/top_p/top_k/min_p/seed/max_tokens), `config` (ctx_size/mtp/mtp_gamma).
+  Priority `request > CLI > per-model config > generation_config.json`.
+  `max_tokens` default = request else per-model else 1024 (serve) / 256 (CLI).
+  `ctx_size` 0 = model max (`max_position_embeddings`, 262144, assume RAM).
+  `GET /v1/models` lists aliases. `FileConfig` dupes host/cache strings (parsed
+  JSON freed). `ModelSpec.max_tokens` plumbed via `Resolved` into routes.
 - Hermitian split: `refAllDecls(server.zig)` in tests.zig BREAKS the
   hermetic link (engine call graph) — server covered by live curl only.
+  `config.zig` is hermetic (refAllDecls in tests.zig, 33 tests).
 
 ## Fused GDN kernel (prefill 2-3.7x)
 

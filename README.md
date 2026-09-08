@@ -131,12 +131,49 @@ curl http://localhost:11234/v1/messages -d '{
 }'
 ```
 
-- `--model` is repeatable; request `model` ids are directory basenames (`Qwen3.8-27B`, `Qwen3.8-27B-nvfp4`, …). Absent `model` → first.
+- `--model` is repeatable; request `model` ids are directory basenames (`Qwen3.8-27B`, `Qwen3.8-27B-nvfp4`, …) unless `--config` gives an `alias`. Absent `model` → first.
 - Engines lazy-load on first request and LRU-evict past `--max-resident-models` (default 1; a 27B bf16 is ~55 GB, quants ~30 GB).
 - Routes: `GET /health`, `GET /v1/models`, `POST /v1/chat/completions` (`stream:true` → SSE + `[DONE]`), `POST /v1/completions`, `POST /v1/messages` (Anthropic, `stream:true` → `message_start/delta/stop`).
-- Request sampling (`temperature`/`top_p`/`top_k`/`seed`, `max_tokens`, `stop`/`stop_sequences`) overlays CLI/base.
+- Request sampling (`temperature`/`top_p`/`top_k`/`seed`, `max_tokens`, `stop`/`stop_sequences`) overlays per-model / CLI base. Priority: `request > CLI > per-model config > generation_config.json > hardcoded`.
+- `ctx-size`: `0` = model max (`max_position_embeddings`, 262144 for Qwen3.8, extensible to 1M). Engine-global per model, not per-request; oversize prompt → `ContextOverflow` → 400. Assume enough unified memory for full context + weights.
 - Image/tool content → 400 (text-only); `n>1` → 400; sequential requests (one in-flight).
 - `stream:true` SSE is buffered (monolithic generate → UTF-8-safe 64B chunks after the fact), format-compatible, not incremental.
+
+## Per-model config JSON (`--config`)
+
+`--config models.json` replaces scattered CLI flags with per-model `alias` + `sampling` + `config`. Merges with CLI `--model` (both allowed); file models come first. `~/` expands via `HOME`.
+
+```json
+{
+  "models": [
+    {
+      "path": "~/opt/models/mlx_models/Qwen3.8-27B",
+      "alias": "qwen-main",
+      "sampling": { "temperature": 0.7, "top_p": 0.95, "top_k": 20, "min_p": 0.05, "seed": 42, "max_tokens": 512 },
+      "config": { "ctx_size": 262144, "mtp": false, "mtp_gamma": 1 }
+    },
+    {
+      "path": "~/opt/models/mlx_models/Qwen3.8-27B-nvfp4",
+      "alias": "qwen-fast",
+      "sampling": { "temperature": 0.0 }
+    }
+  ],
+  "server": { "host": "127.0.0.1", "port": 11234, "max_resident_models": 1 },
+  "cache": { "prefix_cache_entries": 32, "prefix_cache_mem": "2GB", "apc_disk": "10GB", "apc_disk_dir": "/tmp/apc-disk" }
+}
+```
+
+```sh
+./zig-out/bin/mlx-runner --config models.json --serve --port 11234
+curl http://localhost:11234/v1/models  # ["qwen-main","qwen-fast"]
+curl http://localhost:11234/v1/chat/completions -d '{"model":"qwen-fast","messages":[{"role":"user","content":"Hi"}],"max_tokens":64}'
+```
+
+- `path` required; `alias` optional (defaults to basename, must be unique). API `model` id = `alias` if present.
+- `sampling` overlays that checkpoint's `generation_config.json`; `request` still wins. `max_tokens` here is the default when request omits it (server default otherwise 1024, CLI `--prompt` default 256).
+- `config.ctx_size`: `0` or omitted = model max; assume RAM sufficient. `mtp`/`mtp_gamma` (γ=1 stable, γ=2 draft-ahead) per-model.
+- `server`/`cache` are global defaults; CLI flags still override file.
+- See `src/config.zig:loadFile` for parser, `src/server.zig:ModelSpec` for registry.
 
 ## CLI Reference
 
@@ -178,12 +215,13 @@ Options:
   --mtp-gamma <n>     MTP draft count (1 or 2, default: 1)
   --bench             Base-vs-MTP benchmark (needs --model); implies temp 0
   --bench-out <f>     Write bench JSON to f (table always goes to stdout)
-  --tp <n>            Tensor parallel shards (stub v1, default 1)
-  --pipeline <n>      Pipeline stages (stub v1, default 1)
-  --version           Print version and exit
-  --help              Show this help
+   --tp <n>            Tensor parallel shards (stub v1, default 1)
+   --pipeline <n>      Pipeline stages (stub v1, default 1)
+   --config <path>     Per-model config JSON (alias + sampling + per-model ctx/mtp; see below)
+   --version           Print version and exit
+   --help              Show this help
 
-Sampling priority: request > CLI > generation_config.json > hardcoded (1.0/1.0/0/0)
+Sampling priority: request > CLI > per-model config > generation_config.json > hardcoded (1.0/1.0/0/0)
 Qwen3.8 defaults: temp 1.0, top_p 0.95, top_k 20.
 ```
 
@@ -198,7 +236,7 @@ Environment:
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--ctx-size` | `0` (262144) | Pin max context (0 = model max) |
+| `--ctx-size` | `0` = model max (262144) | Pin max context (0 = `max_position_embeddings`; assume RAM sufficient; per-model `config.ctx_size` overrides) |
 | `--prefix-cache-entries` | `32` | Hot RAM LRU (`src/cache.zig:PrefixCache` + `src/apc.zig:ApcCache`) |
 | `--prefix-cache-mem` | `2GB` | Hot byte budget |
 | `--prefix-cache-disk` | `off` | SSD tier for completions (`src/kv_checkpoint.zig`, `KVC\x01`, SHA1, 4096 MiB budget, 6h half-life) |
@@ -234,7 +272,8 @@ Example (nvfp4, 680 tok, striped prompt):
 ## Layout
 
 ```
-src/main.zig          — CLI (std.process.Init + std.Io), repeatable --model
+src/main.zig          — CLI (std.process.Init + std.Io), repeatable --model + --config
+src/config.zig        — per-model config JSON (alias/sampling/ctx/mtp, ~/ expand)
 src/engine.zig        — Engine: chunked prefill, base/MTP decode, hot/disk/APC
 src/model.zig         — qwen3_5 forward (GDN + full attn + MLP; fused Metal kernel)
 src/gdn_packed.metal  — packed GDN recurrence (vendored from mlx_lm, T as uint32[1])
@@ -268,7 +307,7 @@ MODEL=~/opt/models/mlx_models/Qwen3.8-27B
 ./zig-out/bin/mlx-runner --model $MODEL --bench --bench-out bench.json
 ```
 
-Hermetic: `sampling`, `cache`, `tokenizer`, `weights`, `http_api`, `kv_checkpoint`. Linked: `model`, `sample`, `mtp`, `engine`, `bench`, `apc` (Metal, `libmlx`).
+Hermetic: `sampling`, `cache`, `tokenizer`, `weights`, `http_api`, `kv_checkpoint`, `config`. Linked: `model`, `sample`, `mtp`, `engine`, `bench`, `apc` (Metal, `libmlx`).
 
 ## Versioning & Release
 

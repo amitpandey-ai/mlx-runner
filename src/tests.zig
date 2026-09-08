@@ -7,6 +7,7 @@ test {
     std.testing.refAllDecls(@import("weights.zig"));
     std.testing.refAllDecls(@import("http_api.zig"));
     std.testing.refAllDecls(@import("kv_checkpoint.zig"));
+    std.testing.refAllDecls(@import("config.zig"));
 }
 
 test "sampling priority" {

@@ -3,6 +3,7 @@ const sampling = @import("sampling.zig");
 const engine_mod = @import("engine.zig");
 const server = @import("server.zig");
 const mlx = @import("mlx.zig");
+const config_mod = @import("config.zig");
 
 const VERSION = "0.1.0-zig";
 
@@ -47,15 +48,18 @@ fn printUsage(io: std.Io) !void {
         \\  --bench-out <f>     Write bench JSON to f (table always goes to stdout)
         \\  --tp <n>            Tensor parallel shards (stub v1, default 1)
         \\  --pipeline <n>      Pipeline stages (stub v1, default 1)
+        \\  --config <path>     Per-model config JSON (alias + sampling + per-model ctx/mtp; see README)
         \\  --version           Print version and exit
         \\  --help              Show this help
         \\
-        \\Sampling priority: request > CLI > generation_config.json > hardcoded (1.0/1.0/0/0)
+        \\Sampling priority: request > CLI > per-model config > generation_config.json > hardcoded (1.0/1.0/0/0)
         \\Qwen3.8 defaults from generation_config.json: temp 1.0, top_p 0.95, top_k 20.
         \\Examples:
         \\  mlx-runner --model ~/opt/models/mlx_models/Qwen3.8-27B --prompt "The capital of France is" --temp 0 --max-tokens 10
         \\  mlx-runner --model ~/opt/models/mlx_models/Qwen3.8-27B --prompt "Hello" --mtp --stream
         \\  mlx-runner --model ~/opt/models/mlx_models/Qwen3.8-27B --bench --bench-out bench.json
+        \\  mlx-runner --config models.json --serve --port 11234
+        \\  # models.json: {"models":[{"path":"~/opt/.../Qwen3.8-27B","alias":"qwen-main","sampling":{"temperature":0.7}}]}
         \\
     );
     try w.interface.flush();
@@ -108,6 +112,7 @@ pub fn main(init: std.process.Init) !void {
     var tp: u32 = 1;
     var pipeline: u32 = 1;
     var metal_check = false;
+    var config_path: ?[]const u8 = null;
 
     var cli_sampling = sampling.SamplingParams{};
 
@@ -208,6 +213,9 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, arg, "--pipeline") and i + 1 < args.len) {
             i += 1;
             pipeline = std.fmt.parseInt(u32, args[i], 10) catch 1;
+        } else if (std.mem.eql(u8, arg, "--config") and i + 1 < args.len) {
+            i += 1;
+            config_path = args[i];
         } else if (std.mem.eql(u8, arg, "--metal-check")) {
             metal_check = true;
         } else if (arg.len > 0 and arg[0] == '-') {
@@ -220,27 +228,82 @@ pub fn main(init: std.process.Init) !void {
         }
     }
 
-    if (models.items.len == 0) {
-        // Resolve default model from env or home; no hardcoded user path.
-        if (std.c.getenv("MLX_RUNNER_MODEL")) |p| {
-            try models.append(allocator, try allocator.dupe(u8, std.mem.span(p)));
-        } else if (std.c.getenv("HOME")) |h| {
-            const home = std.mem.span(h);
-            const p = try std.fs.path.join(allocator, &.{ home, "opt/models/mlx_models/Qwen3.8-27B" });
-            try models.append(allocator, p);
-        } else {
-            try models.append(allocator, try allocator.dupe(u8, "models/Qwen3.8-27B"));
+    // Load per-model config file if --config given
+    var file_cfg: ?config_mod.FileConfig = null;
+    defer if (file_cfg) |*fc| fc.deinit(allocator);
+    if (config_path) |cp| {
+        file_cfg = config_mod.loadFile(allocator, io, cp) catch |e| {
+            std.log.err("failed to load config {s}: {any}", .{ cp, e });
+            return e;
+        };
+        // Apply file-level server/cache overrides if CLI didn't set them explicitly
+        if (file_cfg.?.server) |s| {
+            if (s.host) |h| host = h;
+            if (s.port) |p| port = p;
+            if (s.max_resident_models) |m| max_resident = m;
+        }
+        if (file_cfg.?.cache) |c| {
+            if (c.prefix_cache_entries) |v| prefix_cache_entries = v;
+            if (c.prefix_cache_mem) |v| prefix_cache_mem = v;
+            if (c.prefix_cache_disk) |v| prefix_cache_disk = v;
+            if (c.apc_disk) |v| apc_disk_quota = v;
+            if (c.apc_disk_dir) |v| apc_disk_dir = v;
         }
     }
-    // Model ids are directory basenames; duplicates would collide on routing.
-    for (models.items, 0..) |a, x| {
-        for (models.items[0..x]) |b| {
-            if (std.mem.eql(u8, std.fs.path.basename(a), std.fs.path.basename(b))) {
-                std.log.err("duplicate model id {s} (basenames must differ)", .{std.fs.path.basename(a)});
+
+    // Build final model specs: config file models + CLI --model flags
+    var specs: std.ArrayList(server.ModelSpec) = .empty;
+    defer specs.deinit(allocator);
+    // From config file
+    if (file_cfg) |fc| {
+        for (fc.models) |m| {
+            var sp: ?sampling.SamplingParams = null;
+            var mt: ?u32 = null;
+            if (m.sampling) |s| {
+                sp = s.toSamplingParams();
+                mt = s.max_tokens;
+            }
+            var sc = server.ModelSpec{ .dir = m.path, .alias = m.alias, .sampling = sp, .max_tokens = mt };
+            if (m.config) |c| {
+                sc.ctx_size = c.ctx_size;
+                sc.mtp = c.mtp;
+                sc.mtp_gamma = c.mtp_gamma;
+            }
+            try specs.append(allocator, sc);
+        }
+    }
+    // From CLI --model flags (use global cli_sampling as per-model sampling if non-default)
+    const cli_has_sampling = blk: {
+        const def = sampling.SamplingParams{};
+        break :blk cli_sampling.temp != def.temp or cli_sampling.top_p != def.top_p or cli_sampling.top_k != def.top_k or cli_sampling.min_p != def.min_p or cli_sampling.seed != null;
+    };
+    for (models.items) |d| {
+        var sp: ?sampling.SamplingParams = null;
+        if (cli_has_sampling) sp = cli_sampling;
+        try specs.append(allocator, .{ .dir = d, .alias = null, .sampling = sp });
+    }
+    // If still empty, use default model
+    if (specs.items.len == 0) {
+        const def_dir = if (std.c.getenv("MLX_RUNNER_MODEL")) |p| try allocator.dupe(u8, std.mem.span(p)) else if (std.c.getenv("HOME")) |h| blk: {
+            const home = std.mem.span(h);
+            break :blk try std.fs.path.join(allocator, &.{ home, "opt/models/mlx_models/Qwen3.8-27B" });
+        } else try allocator.dupe(u8, "models/Qwen3.8-27B");
+        try specs.append(allocator, .{ .dir = def_dir });
+    }
+    // Validate alias/basename uniqueness (alias if present else basename)
+    for (specs.items, 0..) |a, x| {
+        const aid = a.alias orelse std.fs.path.basename(a.dir);
+        for (specs.items[0..x]) |b| {
+            const bid = b.alias orelse std.fs.path.basename(b.dir);
+            if (std.mem.eql(u8, aid, bid)) {
+                std.log.err("duplicate model id {s} (alias or basename must differ)", .{aid});
                 return error.DuplicateModelId;
             }
         }
     }
+    // For non-serve single-model run, we need models list for compat
+    models.clearRetainingCapacity();
+    for (specs.items) |s| try models.append(allocator, s.dir);
     if (metal_check) {
         // Direct mlx-c test — proves zig links libmlxc.dylib (Metal)
         var avail: bool = false;
@@ -276,9 +339,10 @@ pub fn main(init: std.process.Init) !void {
         std.log.info("[distributed] tp={d} pipeline={d} — v1 stub: single-device", .{ tp, pipeline });
     }
 
-    const cfg = engine_mod.EngineConfig{
-        .model = models.items[0],
-        .ctx_size = ctx_size,
+    // Build base EngineConfig from CLI + file global overrides (ctx-size 0 = model max, assume RAM sufficient)
+    const base_cfg = engine_mod.EngineConfig{
+        .model = specs.items[0].dir,
+        .ctx_size = specs.items[0].ctx_size orelse ctx_size,
         .kv_quant = kv_quant,
         .prefix_cache_entries = prefix_cache_entries,
         .prefix_cache_mem = prefix_cache_mem,
@@ -286,28 +350,38 @@ pub fn main(init: std.process.Init) !void {
         .apc_disk_quota = apc_disk_quota,
         .apc_disk_dir = apc_disk_dir,
         .no_vision = no_vision,
-        .mtp = mtp orelse false,
-        .mtp_gamma = mtp_gamma,
+        .mtp = specs.items[0].mtp orelse (mtp orelse false),
+        .mtp_gamma = specs.items[0].mtp_gamma orelse mtp_gamma,
     };
+    const base_sampling = if (specs.items[0].sampling) |s| s else cli_sampling;
+
+    // Per-model sampling for single-model runs (prompt/chat/bench) uses first spec
+    const cfg = base_cfg;
+    const eff_sampling = base_sampling;
 
     if (bench) {
-        try @import("bench.zig").run(allocator, io, cfg, cli_sampling, bench_out);
+        try @import("bench.zig").run(allocator, io, cfg, eff_sampling, bench_out);
         return;
     }
 
     if (serve) {
-        var reg = server.ModelRegistry.init(allocator, io, cfg, cli_sampling, models.items, max_resident);
+        // Build per-model registry from specs (alias + per-model sampling/config)
+        var reg = try server.ModelRegistry.initWithSpecs(allocator, io, base_cfg, cli_sampling, specs.items, max_resident);
         defer reg.deinit();
-        for (models.items) |md| std.log.info("mlx-runner model {s} ({s})", .{ std.fs.path.basename(md), md });
+        for (specs.items) |sp| {
+            const id = sp.alias orelse std.fs.path.basename(sp.dir);
+            std.log.info("mlx-runner model {s} ({s})", .{ id, sp.dir });
+            if (sp.sampling) |s| std.log.info("  sampling {s}: temp={d} top_p={d} top_k={d} min_p={d} seed={?d}", .{ id, s.temp, s.top_p, s.top_k, s.min_p, s.seed });
+        }
         std.log.info("mlx-runner serving on http://{s}:{d} (max {d} resident)", .{ host, port, max_resident });
-        std.log.info("  kv-quant {s}  sampling temp={d} top_p={d} top_k={d} min_p={d}", .{ kv_quant, cli_sampling.temp, cli_sampling.top_p, cli_sampling.top_k, cli_sampling.min_p });
+        std.log.info("  kv-quant {s}  sampling temp={d} top_p={d} top_k={d} min_p={d}", .{ kv_quant, eff_sampling.temp, eff_sampling.top_p, eff_sampling.top_k, eff_sampling.min_p });
         std.log.info("  hot cache {d} entries  disk {s}  apc-disk {s} ({s})  distributed tp={d} pipeline={d}", .{ prefix_cache_entries, if (prefix_cache_disk) |d| d else "off", if (apc_disk_quota) |q| q else "off", if (apc_disk_dir) |d| d else "default", tp, pipeline });
         try server.serve(allocator, io, &reg, host, port);
         return;
     }
 
     if (prompt) |p| {
-        var eng = try engine_mod.Engine.init(allocator, io, cfg, cli_sampling);
+        var eng = try engine_mod.Engine.init(allocator, io, cfg, eff_sampling);
         defer eng.deinit();
         std.log.info("model {s} ctx {d} temp {d} top_p {d} top_k {d}", .{ eng.config.model, eng.model_max_ctx, eng.base_sampling.temp, eng.base_sampling.top_p, eng.base_sampling.top_k });
         if (stream) {
@@ -332,11 +406,11 @@ pub fn main(init: std.process.Init) !void {
     }
 
     if (chat) {
-        var eng = try engine_mod.Engine.init(allocator, io, cfg, cli_sampling);
+        var eng = try engine_mod.Engine.init(allocator, io, cfg, eff_sampling);
         defer eng.deinit();
         var out_buf: [4096]u8 = undefined;
         var out_w = std.Io.File.stdout().writer(io, &out_buf);
-        try out_w.interface.print("mlx-runner chat — model {s} ctx {d} — /exit to quit\n", .{ models.items[0], eng.model_max_ctx });
+        try out_w.interface.print("mlx-runner chat — model {s} ctx {d} — /exit to quit\n", .{ specs.items[0].dir, eng.model_max_ctx });
         try out_w.interface.flush();
         var messages: std.ArrayList([]const u8) = .empty;
         defer {
