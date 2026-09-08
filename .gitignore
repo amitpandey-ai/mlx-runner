@@ -1,0 +1,12 @@
+.zig-cache/
+zig-out/
+.zig-toolchain/
+lib/mlx/
+lib/.mlx-build/
+.DS_Store
+*.o
+*.a
+.env
+.opencode/
+*.log
+plans/

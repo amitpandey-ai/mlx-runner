@@ -1,0 +1,58 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-test:
+    runs-on: macos-26
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Select Xcode
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: latest-stable
+
+      - name: Install Zig (pinned nightly)
+        run: |
+          bash scripts/fetch-zig.sh
+          echo "$GITHUB_WORKSPACE/.zig-toolchain" >> "$GITHUB_PATH"
+
+      - name: Install dependencies
+        run: |
+          brew update
+          brew bundle install --file=Brewfile || brew install cmake webp
+
+      - name: Build mlx + mlx-c
+        run: |
+          bash scripts/build-mlx.sh
+          ls -lh lib/mlx/lib/ || true
+          cat lib/mlx/.version || true
+
+      - name: Build mlx-runner (Zig, ReleaseFast)
+        run: zig build -Doptimize=ReleaseFast
+
+      - name: Smoke test binary
+        run: |
+          ./zig-out/bin/mlx-runner --version
+          ./zig-out/bin/mlx-runner --help > /dev/null
+          ./zig-out/bin/mlx-runner --metal-check
+
+      - name: Run Zig tests (hermetic)
+        run: zig build test --summary all
+
+      - name: Verify mlx-c linkage
+        run: |
+          otool -L zig-out/bin/mlx-runner | grep -q libmlxc || (echo "libmlxc not linked"; exit 1)
+          otool -L zig-out/bin/mlx-runner | grep -q libmlx || (echo "libmlx not linked"; exit 1)
+          echo "linkage OK"
+          ls -lh lib/mlx/lib/

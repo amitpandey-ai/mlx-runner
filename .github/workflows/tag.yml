@@ -1,0 +1,54 @@
+name: Tag
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  tag:
+    runs-on: ubuntu-latest
+    if: github.repository == 'amitpandey-ai/mlx-runner'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Read version
+        id: version
+        run: |
+          # Extract .version from build.zig.zon (e.g. "0.1.0")
+          VER=$(grep -oE '\.version = "[^"]+"' build.zig.zon | cut -d'"' -f2)
+          if [ -z "$VER" ]; then echo "version not found"; exit 1; fi
+          echo "version=$VER" >> "$GITHUB_OUTPUT"
+          echo "tag=v$VER" >> "$GITHUB_OUTPUT"
+          echo "Version: $VER -> tag v$VER"
+
+      - name: Check if tag exists
+        id: check
+        run: |
+          TAG=${{ steps.version.outputs.tag }}
+          if git rev-parse "$TAG" >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "Tag $TAG already exists locally"
+          elif git ls-remote --tags origin | grep -q "refs/tags/$TAG$"; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "Tag $TAG already exists on origin"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            echo "Tag $TAG is new"
+          fi
+
+      - name: Create and push tag
+        if: steps.check.outputs.exists == 'false'
+        run: |
+          TAG=${{ steps.version.outputs.tag }}
+          VER=${{ steps.version.outputs.version }}
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "$TAG" -m "v$VER"
+          git push origin "$TAG"
+          echo "Created and pushed $TAG"
